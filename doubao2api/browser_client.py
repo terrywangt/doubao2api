@@ -1681,6 +1681,9 @@ class BrowserClient:
         Returns:
             Dict with 'videos' list, each having video_url/cover_url/duration.
         """
+        # Each video job needs its own confirmation; reset the per-job flag so
+        # a reused BrowserClient instance confirms for every new video.
+        self._video_confirm_sent = False
         ability_param = {
             "ratio": ratio or "auto",
             "model": model or VIDEO_MODEL,
@@ -1838,9 +1841,12 @@ class BrowserClient:
                 }
 
             # Doubao asks the user to confirm the params before it starts
-            # generating. Type 确认 and send; retry if confirmation still
-            # pending (the markers reappear in each poll until accepted).
-            if any(
+            # generating. Send the confirmation exactly ONCE per video job:
+            # after Doubao accepts it, it replies and starts generating, and
+            # re-sending the confirm costs extra quota. The confirmation
+            # marker stays in the conversation history, so never re-check it
+            # once we have already confirmed this job.
+            if not self._video_confirm_sent and any(
                 any(m in self._message_text(msg) or "" for m in CONFIRM_TEXT_MARKERS)
                 for msg in messages
             ):
