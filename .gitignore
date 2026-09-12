@@ -3,6 +3,11 @@
 decrypted_cookies.json
 .env
 
+# Persistent browser profiles (contain login cookies)
+.browser_data*/
+.doubao_browser/
+.qianwen_browser/
+
 # Python
 __pycache__/
 *.pyc
@@ -19,6 +24,7 @@ venv/
 .idea/
 
 # Generated artifacts
+out/
 doubao_qr_login.png
 server_out.txt
 server_err.txt
@@ -29,5 +35,8 @@ testpic.webp
 Thumbs.db
 .DS_Store
 
-# 本地部署数据
-/data/
+# Account roster (passport ids)
+.doubao_accounts.json
+
+# Docker volume: browser profile + account roster
+data/

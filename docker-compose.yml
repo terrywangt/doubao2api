@@ -3,13 +3,19 @@ services:
     image: ghcr.io/terrywangt/doubao2api:latest
     container_name: doubao2api
     restart: always
+    # Chromium writes the hostname into the profile's SingletonLock. A random
+    # hostname per container makes every rebuild look like a different machine
+    # holding the profile, which Chromium refuses to open.
+    hostname: doubao2api
+    # Chromium in headed mode crashes on the default 64MB /dev/shm.
+    shm_size: 2gb
     ports:
       - "9090:9090"
       - "6080:6080"
     environment:
       - DOUBAO_PORT=9090
       - DOUBAO_HOST=0.0.0.0
-      - DOUBAO_API_KEY=***
+      - DOUBAO_API_KEY=terrywang
       - DOUBAO_RPM_LIMIT=50
       - DOUBAO_TIMEOUT=180
       - DOUBAO_KEEPALIVE_INTERVAL=7200
@@ -20,6 +26,7 @@ services:
     volumes:
       - ./data/doubao_session.json:/app/.doubao_session.json
       - doubao_browser:/root/.doubao_browser
+      - ./data/accounts.json:/app/.doubao_accounts.json
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:9090/health',timeout=5)"]
       interval: 30s

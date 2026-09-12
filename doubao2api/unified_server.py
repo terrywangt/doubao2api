@@ -13,6 +13,7 @@ Start with:
 from __future__ import annotations
 
 import asyncio
+import base64
 import collections
 import json
 import logging
@@ -25,26 +26,26 @@ from typing import Any, Dict, List, Optional
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from .browser_client import BrowserClient
-from .qianwen_client import QianwenClient, QIANWEN_MODELS
+from .accounts import FREE_DAILY_QUOTA, AccountPool
+from .browser_client import VIDEO_MODEL, BrowserClient, QuotaExhaustedError
+from .qianwen_client import QIANWEN_MODELS, QianwenClient
+from .token_counter import SAFETY_FACTOR, count_messages_tokens, count_tokens
 from .tool_calling import (
-    build_tool_system_prompt,
-    convert_messages_with_tools,
-    parse_tool_calls_xml,
-    is_tool_call_start,
-    has_complete_tool_calls,
-    StreamingGuard,
-    detect_truncated_tool_call,
-    build_continuation_prompt,
-    filter_history_by_topic,
     ToolNameObfuscator,
+    build_continuation_prompt,
     coerce_tool_arguments,
+    convert_messages_with_tools,
     deduplicate_continuation,
+    detect_truncated_tool_call,
+    filter_history_by_topic,
+    has_complete_tool_calls,
+    is_tool_call_start,
+    parse_tool_calls_xml,
 )
-from .token_counter import count_tokens, count_messages_tokens, SAFETY_FACTOR
+from .video_jobs import COMPLETED, VideoJobStore
 
 log = logging.getLogger("doubao_unified")
 
@@ -65,6 +66,14 @@ CHAT_MODELS: Dict[str, int] = {
 # Qianwen models (routed to QianwenClient)
 QIANWEN_MODEL_NAMES = set(QIANWEN_MODELS.keys())
 
+# Doubao's own video model ids, taken from the web client's
+# action_bar_selected_options. These are advertised as-is rather than behind an
+# alias, so that whatever a caller passes as "model" is what actually runs.
+VIDEO_MODELS = [VIDEO_MODEL, "seedance_v2.0_mini"]
+
+# Ceiling on a reference image fetched from a caller-supplied image_url.
+MAX_REF_IMAGE_BYTES = 20 * 1024 * 1024
+
 ALL_MODELS = [
     {"id": m, "object": "model", "owned_by": "doubao", "created": 0}
     for m in CHAT_MODELS
@@ -74,7 +83,9 @@ ALL_MODELS = [
 ] + [
     {"id": "doubao-image", "object": "model", "owned_by": "doubao", "created": 0},
     {"id": "doubao-music", "object": "model", "owned_by": "doubao", "created": 0},
-    {"id": "doubao-video", "object": "model", "owned_by": "doubao", "created": 0},
+] + [
+    {"id": m, "object": "model", "owned_by": "doubao", "created": 0}
+    for m in VIDEO_MODELS
 ]
 
 
@@ -144,12 +155,30 @@ def _size_to_ratio(size):
         "1024x1792": "9:16",
         "1024x768": "4:3",
         "768x1024": "3:4",
+        # Sizes the OpenAI Videos API accepts, used by /v1/videos.
+        "1280x720": "16:9",
+        "720x1280": "9:16",
     }
     if size in size_map:
         return size_map[size]
     if ":" in size:
         return size
     return "1:1"
+
+
+def _video_model(body: dict) -> Optional[str]:
+    """Pick the Doubao video model id a request asks for, or None for default.
+
+    `video_model` stays supported for callers written against the older shape.
+    `model` is honoured too, so the ids from /v1/models work directly — but
+    only when it names a real Doubao model, since OpenAI clients send aliases
+    like "sora-2" that mean nothing here.
+    """
+    for key in ("video_model", "model"):
+        requested = str(body.get(key) or "")
+        if requested in VIDEO_MODELS:
+            return requested
+    return None
 
 # ── Request log ring buffer ───────────────────────────────────
 
@@ -228,6 +257,32 @@ def create_app(
 
     _browser: Dict[str, Any] = {}  # holds BrowserClient instance
     _qianwen: Dict[str, Any] = {}  # holds QianwenClient instance
+    _accounts = AccountPool()
+    # Serialize account switches: they mutate the shared browser session.
+    _switch_lock = asyncio.Lock()
+    _video_jobs = VideoJobStore()
+    # asyncio only holds weak references to tasks, so a running generation
+    # would otherwise be collected mid-flight.
+    _video_tasks: set = set()
+
+    async def _sync_accounts(client: BrowserClient) -> int:
+        """Record every account logged into the browser profile.
+
+        Falls back to just the active one when the switch menu cannot be read,
+        so the roster is never left empty.
+        """
+        found = await client.list_accounts()
+        for account in found:
+            _accounts.remember(account["sec_user_id"], account["label"])
+        if found:
+            return len(found)
+        try:
+            current = await client.current_account()
+        except RuntimeError as exc:
+            log.warning("Could not identify current account: %s", exc)
+            return 0
+        _accounts.remember(current["sec_user_id"], current["label"])
+        return 1
 
     async def _browser_watchdog():
         """Background task: check browser health every 30s, auto-restart on crash."""
@@ -250,9 +305,10 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # Ensure browser_client logs are visible
-        logging.getLogger("doubao2api.browser_client").setLevel(logging.INFO)
-        logging.getLogger("doubao2api.browser_client").addHandler(logging.StreamHandler())
+        # Ensure our own logs are visible, including account failover.
+        pkg_log = logging.getLogger("doubao2api")
+        pkg_log.setLevel(logging.INFO)
+        pkg_log.addHandler(logging.StreamHandler())
 
         # Start browser client
         headless = os.environ.get("DOUBAO_HEADLESS", "true").lower() == "true"
@@ -266,6 +322,7 @@ def create_app(
 
         if client.is_ready:
             log.info("Browser client ready (already logged in)")
+            await _sync_accounts(client)
         else:
             log.warning(
                 "Browser not logged in. Visit /auth to scan QR code."
@@ -500,11 +557,6 @@ def create_app(
 
     # ── Endpoints ──
 
-    @app.get("/", response_class=RedirectResponse)
-    async def root_redirect():
-        """Redirect / to /admin so typing the bare IP works."""
-        return RedirectResponse(url="/admin")
-
     @app.get("/health")
     async def health():
         client = _browser.get("client")
@@ -523,7 +575,16 @@ def create_app(
     @app.get("/v1/models")
     async def list_models(request: Request):
         _check_auth(request)
-        return {"object": "list", "data": ALL_MODELS}
+        client = _browser.get("client")
+        qw = _qianwen.get("client")
+        ready = {
+            "doubao": client.is_ready if client else False,
+            "qianwen": qw.is_ready if qw else False,
+        }
+        # Unknown owners stay listed: a backend added later without registering
+        # here should be visible rather than silently disappear.
+        data = [m for m in ALL_MODELS if ready.get(m["owned_by"], True)]
+        return {"object": "list", "data": data}
 
     @app.post("/v1/chat/completions")
     async def chat_completions(body: ChatCompletionRequest, request: Request):
@@ -733,7 +794,7 @@ def create_app(
                 parsed = parse_tool_calls_xml(source)
                 if not parsed and content:
                     parsed = parse_tool_calls_xml(content)
-                
+
                 # Auto-continue if tool call was truncated
                 if not parsed and detect_truncated_tool_call(source or content):
                     log.info("Detected truncated tool_call, attempting continuation...")
@@ -750,7 +811,7 @@ def create_app(
                             log.info("Continuation successful, got %d tool calls", len(parsed))
                     except Exception as e:
                         log.warning("Continuation failed: %s", e)
-                
+
                 if parsed:
                     # Deobfuscate tool names back to original
                     parsed = _tool_obfuscator.deobfuscate_tool_calls(parsed)
@@ -920,7 +981,7 @@ def create_app(
             # Also try main content if think didn't have it
             if not parsed and full_content:
                 parsed = parse_tool_calls_xml(full_content)
-            
+
             # Auto-continue if truncated
             if not parsed and detect_truncated_tool_call(source or full_content):
                 log.info("Stream: detected truncated tool_call, attempting continuation...")
@@ -936,7 +997,7 @@ def create_app(
                         log.info("Stream continuation got %d tool calls", len(parsed))
                 except Exception as e:
                     log.warning("Stream continuation failed: %s", e)
-            
+
             if parsed:
                 # Deobfuscate tool names back to original
                 parsed = _tool_obfuscator.deobfuscate_tool_calls(parsed)
@@ -1034,6 +1095,141 @@ def create_app(
             "data": tracks,
         })
 
+    @app.post("/v1/video/ref_image")
+    async def upload_video_ref_image(request: Request):
+        """Upload one or more images for image-to-video and register them.
+
+        Images sent together are registered as one group, which is what lets a
+        single generation reference them all; uploading them one call at a time
+        registers them separately instead. One file answers with the object it
+        always did, several with the list to pass back as ref_image.
+        """
+        _check_auth(request)
+        await bucket.acquire()
+        client = _get_client()
+        form = await request.form()
+        uploads = [v for _, v in form.multi_items() if hasattr(v, "read")]
+        if not uploads:
+            raise HTTPException(status_code=400, detail="Missing file field")
+        images = [(await u.read(), u.filename or "image.png") for u in uploads]
+        try:
+            refs = await client.upload_ref_images(images)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+        return JSONResponse(refs[0] if len(refs) == 1 else refs)
+
+    def _video_ref_images(body: dict) -> List[dict]:
+        """Build the image-to-video reference list from the request body.
+
+        Accepts one object or a list of them under "ref_image", or the bare TOS
+        uri(s) in "ref_image_key" (the key returned by /v1/images/upload).
+        """
+        refs = body.get("ref_image")
+        if isinstance(refs, dict):
+            refs = [refs]
+        if isinstance(refs, list):
+            usable = [r for r in refs if isinstance(r, dict) and r.get("uri")]
+            if usable:
+                return usable
+        keys = body.get("ref_image_key")
+        if isinstance(keys, str):
+            keys = [keys]
+        if isinstance(keys, list):
+            return [{"uri": key} for key in keys if key]
+        return []
+
+    async def _generate_video_failover(
+        client: BrowserClient, kwargs: dict
+    ) -> dict:
+        """Generate a video, rolling to another account when quota runs out.
+
+        Each account's free video quota resets daily, so an exhausted one is
+        parked for the day rather than retried. Accounts must already be logged
+        into the browser profile; this only re-points the session at one.
+        """
+        while True:
+            try:
+                result = await client.generate_video(**kwargs)
+            except QuotaExhaustedError as exc:
+                async with _switch_lock:
+                    try:
+                        current = await client.current_account()
+                    except RuntimeError:
+                        raise exc
+                    _accounts.mark_exhausted(current["sec_user_id"])
+                    candidates = _accounts.candidates(
+                        exclude=current["sec_user_id"]
+                    )
+                    if not candidates:
+                        log.warning("video: no accounts left with quota today")
+                        raise exc
+                    nxt = candidates[0]
+                    log.info("video: quota exhausted on %s, switching to %s",
+                             current["label"], nxt.get("label") or "?")
+                    try:
+                        switched = await client.switch_account(
+                            nxt["sec_user_id"]
+                        )
+                    except RuntimeError as sw_exc:
+                        raise RuntimeError(
+                            f"quota exhausted and switch failed: {sw_exc}"
+                        ) from exc
+                    _accounts.remember(
+                        switched["sec_user_id"], switched["label"]
+                    )
+                continue
+
+            try:
+                used_by = await client.current_account()
+                _accounts.record_usage(used_by["sec_user_id"])
+            except RuntimeError as exc:
+                # Usage counting is cosmetic; never fail a finished video.
+                log.warning("Could not record quota usage: %s", exc)
+            return result
+
+    @app.get("/admin/api/accounts")
+    async def admin_accounts(request: Request):
+        """List the known accounts and which one is active."""
+        _check_auth(request)
+        client = _browser.get("client")
+        current = ""
+        if client is not None and client.is_ready:
+            try:
+                current = (await client.current_account())["sec_user_id"]
+            except RuntimeError as exc:
+                log.warning("admin_accounts: %s", exc)
+        return JSONResponse({
+            "current": current,
+            "quota_estimate": FREE_DAILY_QUOTA,
+            "accounts": _accounts.snapshot(current),
+        })
+
+    @app.post("/admin/api/accounts/sync")
+    async def admin_accounts_sync(request: Request):
+        """Re-read the browser's account menu and record every account found."""
+        _check_auth(request)
+        client = _get_client()
+        async with _switch_lock:
+            count = await _sync_accounts(client)
+        return JSONResponse({"synced": count})
+
+    @app.post("/admin/api/accounts/switch")
+    async def admin_accounts_switch(request: Request):
+        """Switch the browser session to another logged-in account."""
+        _check_auth(request)
+        client = _get_client()
+        body = await request.json()
+        sec_user_id = body.get("sec_user_id", "")
+        if not sec_user_id:
+            raise HTTPException(status_code=400, detail="Missing sec_user_id")
+        async with _switch_lock:
+            try:
+                account = await client.switch_account(sec_user_id)
+            except RuntimeError as exc:
+                raise HTTPException(status_code=502, detail=str(exc))
+            _accounts.remember(account["sec_user_id"], account["label"])
+        return JSONResponse(account)
+
     @app.post("/v1/video/generations")
     async def video_generations(request: Request):
         _check_auth(request)
@@ -1049,10 +1245,16 @@ def create_app(
         if ratio and "x" in str(ratio):
             ratio = _size_to_ratio(ratio)
 
+        kwargs = dict(
+            prompt=prompt, ratio=ratio,
+            duration=int(body.get("duration") or 10),
+            model=_video_model(body),
+            ref_image=_video_ref_images(body),
+        )
         try:
-            result = await client.generate_video(
-                prompt=prompt, ratio=ratio,
-            )
+            result = await _generate_video_failover(client, kwargs)
+        except QuotaExhaustedError as exc:
+            raise HTTPException(status_code=429, detail=str(exc))
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
 
@@ -1067,6 +1269,322 @@ def create_app(
             "created": int(time.time()),
             "data": videos,
         })
+
+    # ── OpenAI Videos API ────────────────────────────────────────
+    #
+    # The same generation path as /v1/video/generations, re-shaped as a job so
+    # that OpenAI SDK clients (client.videos.create / retrieve /
+    # download_content) work against this server unchanged. Jobs run
+    # concurrently, bounded by the same rate limiter as every other endpoint.
+
+    async def _video_job_body(request: Request):
+        """Read a create-job request, which arrives as JSON or as multipart.
+
+        The OpenAI SDK posts multipart whenever input_reference carries a file
+        and JSON otherwise, so both have to be accepted. Every uploaded part is
+        taken as a reference image whatever its field name: callers spell it
+        input_reference, image and file about equally often, and ignoring the
+        wrong spelling would start a text-to-video whose prompt talks about a
+        picture the model never received.
+        """
+        if request.headers.get("content-type", "").startswith("multipart/form-data"):
+            form = await request.form()
+            uploads = [v for _, v in form.multi_items() if hasattr(v, "read")]
+            fields = {k: v for k, v in form.multi_items() if not hasattr(v, "read")}
+            return fields, uploads
+        return await request.json(), []
+
+    async def _fetch_ref_image(url: str):
+        """Download a reference image given by URL, as (bytes, filename).
+
+        Accepts http(s) and data URIs. This makes the server fetch an address
+        the caller chose, which is fine for the local, authenticated
+        deployment this is built for but would need an allowlist if the port
+        were ever exposed.
+        """
+        if url.startswith("data:"):
+            header, _, payload = url.partition(",")
+            if not payload:
+                raise HTTPException(status_code=400, detail="Malformed data URI")
+            # Size guard: base64 encoding is ~1.33x, so limit raw chars
+            if len(payload) > MAX_REF_IMAGE_BYTES * 1.4:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Data URI too large (max {MAX_REF_IMAGE_BYTES // (1024*1024)}MB)",
+                )
+            try:
+                data = (base64.b64decode(payload) if ";base64" in header
+                        else payload.encode())
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Malformed data URI")
+            if len(data) > MAX_REF_IMAGE_BYTES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Decoded data URI exceeds {MAX_REF_IMAGE_BYTES // (1024*1024)}MB",
+                )
+            subtype = header.partition("/")[2].partition(";")[0]
+            return data, f"ref.{subtype or 'png'}"
+
+        if not url.startswith(("http://", "https://")):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported image_url scheme: {url[:32]}",
+            )
+        try:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as http:
+                resp = await http.get(url)
+        except httpx.HTTPError as exc:
+            # The address came from the caller, so an unreachable host is a bad
+            # request rather than a server fault.
+            raise HTTPException(
+                status_code=400, detail=f"Could not fetch image_url: {exc}"
+            )
+        if resp.status_code >= 400:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not fetch image_url: HTTP {resp.status_code}",
+            )
+        if len(resp.content) > MAX_REF_IMAGE_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Reference image exceeds {MAX_REF_IMAGE_BYTES} bytes",
+            )
+        return resp.content, url.split("?")[0].rsplit("/", 1)[-1] or "ref.png"
+
+    async def _video_job_refs(
+        client: BrowserClient, body: dict, uploads: list
+    ) -> List[dict]:
+        """Resolve the request's reference images into Doubao ref_images.
+
+        Handles every form OpenAI's input_reference takes, plus this server's
+        own ref_image object, and accepts a list of any of them for a
+        multi-reference generation. Rejects rather than returning an empty list
+        once the caller has clearly tried to send a reference: dropping it
+        silently costs eight minutes and a generation before the failure
+        surfaces.
+        """
+        if uploads:
+            images = [(await u.read(), u.filename or "ref.png") for u in uploads]
+            return await client.upload_ref_images(images)
+
+        # Multipart carries every non-file part as text, so an object or list
+        # arrives here as a JSON string rather than as a dict or list.
+        ref = body.get("input_reference")
+        if isinstance(ref, str) and ref.lstrip()[:1] in ("{", "["):
+            try:
+                ref = json.loads(ref)
+            except json.JSONDecodeError:
+                raise HTTPException(
+                    status_code=400, detail="input_reference is not valid JSON"
+                )
+
+        urls = []
+        for item in (ref if isinstance(ref, list) else [ref] if ref else []):
+            if isinstance(item, dict) and item.get("file_id"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="input_reference.file_id is not supported: /v1/files "
+                           "writes to Doubao's document bucket, which the video "
+                           "ability rejects. Upload through POST /v1/video/ref_image "
+                           "and pass its result as ref_image instead.",
+                )
+            url = item if isinstance(item, str) else ""
+            if isinstance(item, dict):
+                url = item.get("image_url") or ""
+                if isinstance(url, dict):  # OpenAI also nests it as {"url": ...}
+                    url = url.get("url") or ""
+            if url:
+                urls.append(url)
+        if urls:
+            images = [await _fetch_ref_image(url) for url in urls]
+            return await client.upload_ref_images(images)
+
+        native_ref = body.get("ref_image")
+        if isinstance(native_ref, str) and native_ref.lstrip()[:1] in ("{", "["):
+            try:
+                body = {**body, "ref_image": json.loads(native_ref)}
+            except json.JSONDecodeError:
+                raise HTTPException(
+                    status_code=400, detail="ref_image is not valid JSON"
+                )
+
+        native = _video_ref_images(body)
+        if native:
+            return native
+
+        if body.get("input_reference") or body.get("ref_image"):
+            raise HTTPException(
+                status_code=400,
+                detail="Could not read a reference image from the request. "
+                       "Send it as a multipart file part, as "
+                       "input_reference.image_url, or as the whole object "
+                       "returned by POST /v1/video/ref_image.",
+            )
+        return []
+
+    async def _run_video_job(job, kwargs: dict) -> None:
+        """Run one generation to completion and fold the outcome into the job."""
+        job.mark_running()
+        try:
+            await bucket.acquire()
+            result = await _generate_video_failover(_get_client(), kwargs)
+        except QuotaExhaustedError as exc:
+            job.fail("quota_exhausted", str(exc))
+            return
+        except HTTPException as exc:
+            job.fail("server_error", str(exc.detail))
+            return
+        except Exception as exc:  # noqa: BLE001 - a job must never leak
+            log.exception("video job %s failed", job.id)
+            job.fail("generation_failed", str(exc))
+            return
+
+        videos = result.get("videos") or []
+        if not videos:
+            # Doubao answered in prose instead of generating — normally a
+            # clarifying question or a refusal.
+            job.fail("no_video", result.get("message") or "No videos generated")
+            return
+        job.complete(videos[0])
+
+    async def _cdn_stream(url: str):
+        """Yield a signed Doubao CDN body, owning the client for the duration.
+
+        A fresh client is used so the Doubao session cookies never reach the
+        CDN host.
+        """
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, read=300.0), follow_redirects=True
+        )
+        try:
+            async with client.stream("GET", url) as resp:
+                if resp.status_code >= 400:
+                    log.warning(
+                        "video content: CDN returned %s, the signed URL has "
+                        "most likely expired", resp.status_code,
+                    )
+                    return
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
+        finally:
+            await client.aclose()
+
+    @app.post("/v1/videos")
+    async def create_video(request: Request):
+        """Create a video job and return it immediately, still queued."""
+        _check_auth(request)
+        client = _get_client()
+        body, uploads = await _video_job_body(request)
+
+        prompt = body.get("prompt", "")
+        if not prompt:
+            raise HTTPException(status_code=400, detail="Missing prompt")
+
+        size = str(body.get("size") or "720x1280")
+        seconds = str(body.get("seconds") or 4)
+        try:
+            duration = int(float(seconds))
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid seconds: {seconds!r}"
+            )
+
+        # Uploading the references here rather than inside the job means a bad
+        # image fails the create call outright instead of a minute later.
+        try:
+            ref_images = await _video_job_refs(client, body, uploads)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+
+        kwargs = dict(
+            prompt=prompt,
+            ratio=_size_to_ratio(size),
+            duration=duration,
+            model=_video_model(body),
+            ref_image=ref_images,
+        )
+        # Echo the model that will actually run, not the one that was asked
+        # for: an OpenAI client sends "sora-2", which resolves to the default.
+        job = _video_jobs.create(
+            model=kwargs["model"] or VIDEO_MODEL,
+            size=size,
+            seconds=str(duration),
+        )
+        task = asyncio.create_task(_run_video_job(job, kwargs))
+        _video_tasks.add(task)
+        task.add_done_callback(_video_tasks.discard)
+        return JSONResponse(job.to_dict())
+
+    @app.get("/v1/videos")
+    async def list_videos(request: Request):
+        """List the jobs this server still remembers."""
+        _check_auth(request)
+        params = request.query_params
+        try:
+            limit = min(int(params.get("limit") or 20), 100)
+        except ValueError:
+            limit = 20
+        jobs = _video_jobs.list(
+            limit=limit,
+            order=params.get("order") or "desc",
+            after=params.get("after") or "",
+        )
+        return JSONResponse(
+            {"object": "list", "data": [job.to_dict() for job in jobs]}
+        )
+
+    @app.get("/v1/videos/{video_id}")
+    async def retrieve_video(video_id: str, request: Request):
+        _check_auth(request)
+        job = _video_jobs.get(video_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"No such video: {video_id}")
+        return JSONResponse(job.to_dict())
+
+    @app.delete("/v1/videos/{video_id}")
+    async def delete_video(video_id: str, request: Request):
+        """Forget a job. The video stays on Doubao's CDN either way."""
+        _check_auth(request)
+        if not _video_jobs.delete(video_id):
+            raise HTTPException(status_code=404, detail=f"No such video: {video_id}")
+        return JSONResponse(
+            {"id": video_id, "object": "video.deleted", "deleted": True}
+        )
+
+    @app.get("/v1/videos/{video_id}/content")
+    async def download_video_content(video_id: str, request: Request):
+        """Stream the finished MP4, or its cover image, back from the CDN."""
+        _check_auth(request)
+        job = _video_jobs.get(video_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"No such video: {video_id}")
+        if job.status != COMPLETED:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Video is {job.status}, not ready to download",
+            )
+
+        variant = request.query_params.get("variant") or "video"
+        if variant == "video":
+            url, media_type, ext = job.video.get("video_url", ""), "video/mp4", "mp4"
+        elif variant == "thumbnail":
+            url, media_type, ext = job.video.get("cover_url", ""), "image/jpeg", "jpg"
+        else:
+            # OpenAI also offers "spritesheet"; Doubao produces no equivalent.
+            raise HTTPException(
+                status_code=400, detail=f"Unsupported variant: {variant}"
+            )
+        if not url:
+            raise HTTPException(
+                status_code=404, detail=f"No {variant} available for {video_id}"
+            )
+        return StreamingResponse(
+            _cdn_stream(url),
+            media_type=media_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{video_id}.{ext}"'
+            },
+        )
 
     @app.post("/v1/files")
     async def upload_file(request: Request):
@@ -1681,7 +2199,7 @@ def create_app(
             "models": {
                 "chat": list(CHAT_MODELS.keys()),
                 "image": ["doubao-image"],
-                "video": ["doubao-video"],
+                "video": VIDEO_MODELS,
                 "audio": ["doubao-music"],
             },
         })
@@ -1795,6 +2313,15 @@ def create_app(
 
         actual_logged_in = client.is_ready and login_btn_count == 0
 
+        # Auto-recover: if browser is logged in (no button) but is_ready is False
+        # (e.g. after VNC manual login), re-run login init automatically.
+        if login_btn_count == 0 and not client.is_ready:
+            try:
+                await client._check_login_state()
+            except Exception:
+                pass
+        actual_logged_in = client.is_ready and login_btn_count == 0
+
         return {
             "logged_in": actual_logged_in,
             "is_ready_flag": client.is_ready,
@@ -1820,6 +2347,19 @@ def create_app(
             return {"result": result}
         except Exception as e:
             return {"error": str(e)}
+
+    @app.get("/auth/pull_conv")
+    async def auth_pull_conv(request: Request, conversation_id: str):
+        """Exercise the history-polling path against an existing conversation."""
+        if os.environ.get("DOUBAO_DEBUG_CAPTURE", "false").lower() != "true":
+            raise HTTPException(status_code=404, detail="Not Found")
+        _check_auth(request)
+        client = _get_client()
+        messages = await client._pull_conversation_messages(conversation_id)
+        return {
+            "messages": len(messages),
+            "videos": client._extract_videos(messages),
+        }
 
     @app.get("/auth/screenshot")
     async def auth_screenshot(request: Request):
@@ -1949,7 +2489,7 @@ def run_server():
 
     app = create_app(api_key=api_key or None, rpm_limit=rpm)
 
-    print(f"\n  Doubao API Server (Playwright)")
+    print("\n  Doubao API Server (Playwright)")
     print(f"  Listening on http://{host}:{port}")
     print(f"  Admin page: http://{host}:{port}/admin")
     if novnc_url:
