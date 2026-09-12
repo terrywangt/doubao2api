@@ -28,3 +28,6 @@ testpic.webp
 # OS
 Thumbs.db
 .DS_Store
+
+# 本地部署数据
+/data/

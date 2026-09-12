@@ -1,0 +1,27 @@
+services:
+  doubao2api:
+    image: ghcr.io/terrywangt/doubao2api:latest
+    container_name: doubao2api
+    restart: always
+    ports:
+      - "9090:9090"
+    environment:
+      - DOUBAO_PORT=9090
+      - DOUBAO_HOST=0.0.0.0
+      - DOUBAO_API_KEY=terrywang
+      - DOUBAO_RPM_LIMIT=50
+      - DOUBAO_TIMEOUT=180
+      - DOUBAO_KEEPALIVE_INTERVAL=7200
+      - DOUBAO_BOT_ID=7338286299411103781
+    volumes:
+      - ./data/doubao_session.json:/app/.doubao_session.json
+      - doubao_browser:/root/.doubao_browser
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:9090/health',timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  doubao_browser:
