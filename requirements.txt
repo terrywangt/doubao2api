@@ -1,5 +1,9 @@
-# Core dependencies
+# Core dependencies (aligned with README install line)
 aiohttp>=3.9
 fastapi>=0.100
 pydantic>=2.0
 uvicorn>=0.20
+httpx>=0.24
+playwright>=1.40
+playwright-stealth>=1.0.6
+python-multipart>=0.0.6
