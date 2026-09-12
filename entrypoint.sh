@@ -10,6 +10,8 @@ PROFILE="${DOUBAO_BROWSER_DATA:-/root/.doubao_browser}"
 rm -f "${PROFILE}/SingletonLock" "${PROFILE}/SingletonCookie" "${PROFILE}/SingletonSocket" 2>/dev/null || true
 
 echo "Starting Xvfb on :99..."
+# 上次异常退出会遗留 X 锁，Xvfb 会拒绝启动——先清理再起
+rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true
 Xvfb :99 -screen 0 1280x800x24 -ac +extension GLX +render -noreset > /tmp/xvfb.log 2>&1 &
 XVFB_PID=$!
 
