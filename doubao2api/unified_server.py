@@ -155,6 +155,9 @@ def _size_to_ratio(size):
         "1024x1792": "9:16",
         "1024x768": "4:3",
         "768x1024": "3:4",
+        # Huobao drama defaults.
+        "1920x1080": "16:9",
+        "1080x1920": "9:16",
         # Sizes the OpenAI Videos API accepts, used by /v1/videos.
         "1280x720": "16:9",
         "720x1280": "9:16",
