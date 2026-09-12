@@ -467,6 +467,18 @@ def create_app(
             raise HTTPException(status_code=400, detail=f"Unsupported file_url: {url[:80]}")
         return files
 
+    # ── Path normalization: collapse // → / ──
+
+    @app.middleware("http")
+    async def _normalize_path(request: Request, call_next):
+        path = request.url.path
+        if "//" in path:
+            normalized = "/" + "/".join(p for p in path.split("/") if p)
+            if normalized != path:
+                from fastapi.responses import RedirectResponse
+                return RedirectResponse(url=normalized + ("?" + request.url.query if request.url.query else ""))
+        return await call_next(request)
+
     # ── Request logging middleware ──
 
     @app.middleware("http")
@@ -1770,6 +1782,14 @@ def create_app(
             try:
                 login_btn = client.page.locator('button:has-text("登录")')
                 login_btn_count = await login_btn.count()
+            except Exception:
+                pass
+
+        # Auto-recover: if browser is logged in (no button) but is_ready is False
+        # (e.g. after VNC manual login), re-run login init automatically.
+        if login_btn_count == 0 and not client.is_ready:
+            try:
+                await client._check_login_state()
             except Exception:
                 pass
 
