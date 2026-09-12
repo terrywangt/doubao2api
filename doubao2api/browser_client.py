@@ -105,8 +105,14 @@ ATTACHMENT_TYPE_IMAGE = 1
 PAYWALL_EXT_KEY = "inner_paywall_cta_param"
 # Doubao asks the user to confirm generation params before starting a video.
 # The confirmation message carries these markers; we auto-confirm by typing.
-CONFIRM_TEXT_MARKERS = ("请先确认以下参数", "确认后我再开始生成视频")
-CONFIRM_REPLY_TEXT = "确认"
+# Real prompts observed: "我将为你生成一条 X 秒的...，请先确认参数：" and
+# "请确认视频参数：..." and "确认后我再开始生成视频".
+CONFIRM_TEXT_MARKERS = (
+    "请先确认参数",
+    "请确认视频参数",
+    "确认后我再开始生成视频",
+)
+CONFIRM_REPLY_TEXT = "确认，开始生成"
 PASSPORT_INFO_PATH = "/passport/account/info/v2/?account_sdk_source=web"
 PASSPORT_SWITCH_PATH = "/passport/web/account/switch/"
 
@@ -1274,7 +1280,9 @@ class BrowserClient:
                 if self._page.url != target:
                     await self._page.goto(target, wait_until="domcontentloaded")
                     await asyncio.sleep(2)
-                # Focus the chat input (contenteditable) and type the reply.
+                # Focus the chat input and type the reply with real keyboard
+                # events (Playwright CDP input triggers React's onChange).
+                # Then prefer the visible send button; Enter as fallback.
                 focused = await self._page.evaluate("""() => {
                     const ta = document.querySelector(
                         'div[contenteditable="true"], textarea'
@@ -1287,9 +1295,31 @@ class BrowserClient:
                     log.warning("generate_video: chat input not found for confirm")
                     return False
                 await self._page.keyboard.type(CONFIRM_REPLY_TEXT, delay=30)
-                await asyncio.sleep(0.3)
-                await self._page.keyboard.press("Enter")
-                log.info("generate_video: confirmation sent")
+                await asyncio.sleep(0.5)
+                # 先找发送按钮(文本或 aria 都可能;也可能是指示图标按钮)。
+                # 找到就点,找不到回退 Enter。
+                sent = await self._page.evaluate("""() => {
+                    const btns = Array.from(document.querySelectorAll(
+                        'button, [role="button"]'
+                    ));
+                    const send = btns.find(b => {
+                        const t = (b.innerText || '').trim();
+                        const aria = (b.getAttribute('aria-label') || '');
+                        const cls = String(b.className || '');
+                        return t === '发送' || aria === '发送' ||
+                               /send|发送|input_send/i.test(t + ' ' + aria + ' ' + cls)
+                                  && (t.length <= 6 || aria.length <= 6 || cls.length < 60);
+                    });
+                    if (send && !send.disabled) {
+                        send.click();
+                        return true;
+                    }
+                    return false;
+                }""")
+                if not sent:
+                    await self._page.keyboard.press("Enter")
+                await asyncio.sleep(0.8)
+                log.info("generate_video: confirmation sent (button=%s)", sent)
                 return True
             except Exception as exc:
                 log.warning("generate_video: confirm failed: %s", exc)
@@ -1808,8 +1838,12 @@ class BrowserClient:
                 }
 
             # Doubao asks the user to confirm the params before it starts
-            # generating. Type 确认 and send once; the poll continues normally.
-            if not self._video_confirm_sent:
+            # generating. Type 确认 and send; retry if confirmation still
+            # pending (the markers reappear in each poll until accepted).
+            if any(
+                any(m in self._message_text(msg) or "" for m in CONFIRM_TEXT_MARKERS)
+                for msg in messages
+            ):
                 confirmed = await self._confirm_video_params(messages, conversation_id)
                 if confirmed:
                     self._video_confirm_sent = True
