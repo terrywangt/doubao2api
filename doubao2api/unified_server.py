@@ -263,6 +263,9 @@ def create_app(
     _accounts = AccountPool()
     # Serialize account switches: they mutate the shared browser session.
     _switch_lock = asyncio.Lock()
+    # Serialize image generations: concurrent calls into the single headed
+    # browser page crash it and trip Doubao risk control (710022004).
+    _image_lock = asyncio.Lock()
     _video_jobs = VideoJobStore()
     # asyncio only holds weak references to tasks, so a running generation
     # would otherwise be collected mid-flight.
@@ -1034,37 +1037,43 @@ def create_app(
     @app.post("/v1/images/generations")
     async def image_generations(body: ImageGenerationRequest, request: Request):
         _check_auth(request)
-        await bucket.acquire()
         client = _get_client()
 
-        ratio = body.ratio or _size_to_ratio(body.size)
-
+        # 串行化图片生成:同一个 headed 浏览器会话并发烧图会把页面打崩
+        # (Target page closed)并触发豆包风控(710022004 rate limited)。
+        # 用全局锁让并发请求排队,一次只打一个请求到浏览器。
+        await _image_lock.acquire()
         try:
-            result = await client.generate_image(
-                prompt=body.prompt,
-                ratio=ratio,
-                ref_image_key=body.ref_image_key,
-            )
-        except RuntimeError as exc:
-            raise HTTPException(status_code=502, detail=str(exc))
+            await bucket.acquire()
+            ratio = body.ratio or _size_to_ratio(body.size)
+            try:
+                result = await client.generate_image(
+                    prompt=body.prompt,
+                    ratio=ratio,
+                    ref_image_key=body.ref_image_key,
+                )
+            except RuntimeError as exc:
+                raise HTTPException(status_code=502, detail=str(exc))
 
-        images = result.get("images", [])
-        if not images:
-            raise HTTPException(
-                status_code=502, detail="No images generated"
-            )
+            images = result.get("images", [])
+            if not images:
+                raise HTTPException(
+                    status_code=502, detail="No images generated"
+                )
 
-        data = []
-        for img in images:
-            data.append({
-                "url": img["url"],
-                "revised_prompt": body.prompt,
+            data = []
+            for img in images:
+                data.append({
+                    "url": img["url"],
+                    "revised_prompt": body.prompt,
+                })
+
+            return JSONResponse({
+                "created": int(time.time()),
+                "data": data,
             })
-
-        return JSONResponse({
-            "created": int(time.time()),
-            "data": data,
-        })
+        finally:
+            _image_lock.release()
 
 
     @app.post("/v1/audio/generations")
