@@ -103,6 +103,10 @@ ATTACHMENT_TYPE_IMAGE = 1
 # Only present on a reply that was refused for lack of quota; successful
 # generations never carry it.
 PAYWALL_EXT_KEY = "inner_paywall_cta_param"
+# Doubao asks the user to confirm generation params before starting a video.
+# The confirmation message carries these markers; we auto-confirm by typing.
+CONFIRM_TEXT_MARKERS = ("请先确认以下参数", "确认后我再开始生成视频")
+CONFIRM_REPLY_TEXT = "确认"
 PASSPORT_INFO_PATH = "/passport/account/info/v2/?account_sdk_source=web"
 PASSPORT_SWITCH_PATH = "/passport/web/account/switch/"
 
@@ -184,6 +188,9 @@ class BrowserClient:
         self._consecutive_failures: int = 0
         self._last_error_code: int = 0
         self._needs_captcha: bool = False
+        # Video param confirmation: Doubao asks the user to confirm params
+        # before actually generating. We auto-confirm once per poll loop.
+        self._video_confirm_sent: bool = False
         # Stream bridge: request_id -> asyncio.Queue for SSE chunks
         self._stream_queues: Dict[str, asyncio.Queue] = {}
         self._bridge_ready: bool = False
@@ -612,6 +619,7 @@ class BrowserClient:
         chat_ability: Optional[Dict[str, Any]] = None,
         leading_blocks: Optional[List[Dict[str, Any]]] = None,
         leading_message_id: Optional[str] = None,
+        idle_timeout: Optional[float] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Send a chat message and yield SSE events via in-browser fetch.
 
@@ -775,9 +783,25 @@ class BrowserClient:
         )
 
         # Yield parsed SSE events from queue
+        # Video submit: Doubao keeps the SSE open while it renders (no data), so
+        # a plain inactivity timeout would fail the request before polling even
+        # starts. With idle_timeout, a quiet stream that already delivered its
+        # first chunk is treated as finished instead of an error.
+        received_any = False
         try:
             while True:
-                chunk_json = await asyncio.wait_for(queue.get(), timeout=180)
+                try:
+                    chunk_json = await asyncio.wait_for(queue.get(), timeout=180)
+                except asyncio.TimeoutError:
+                    if idle_timeout is not None and received_any:
+                        # Stream went quiet after a first chunk; treat it as
+                        # finished rather than erroring (video submit stays open
+                        # while Doubao renders, so we just move on to polling).
+                        log.info("chat_completion: idle %ss after first chunk, treating as done",
+                                 idle_timeout)
+                        break
+                    raise
+                received_any = True
                 if chunk_json is None:
                     # Stream complete
                     break
@@ -1222,6 +1246,57 @@ class BrowserClient:
             return text_block.get("text", "")
         return ""
 
+    async def _confirm_video_params(
+        self, messages: List[Dict[str, Any]], conversation_id: str
+    ) -> bool:
+        """Type 确认 when Doubao asks the user to confirm video generation params.
+
+        Doubao's web client now replies with a confirmation message ("请先确认
+        以下参数") instead of generating immediately. The UI needs a text reply
+        of "确认" in the chat input, sent with Enter. The video generation runs
+        in a background conversation; the browser must be navigated there first,
+        otherwise the confirm lands in whatever chat is currently displayed.
+        Returns True when a confirmation was sent.
+        """
+        if not self._page:
+            return False
+        for msg in messages:
+            text = self._message_text(msg) or ""
+            if not any(m in text for m in CONFIRM_TEXT_MARKERS):
+                continue
+            try:
+                log.info("generate_video: Doubao asks for param confirmation; "
+                         "navigating to convo %s then typing \"%s\"",
+                         conversation_id, CONFIRM_REPLY_TEXT)
+                # Navigate to the conversation where the video request lives so
+                # the typed confirm reaches the right chat.
+                target = f"https://www.doubao.com/chat/{conversation_id}"
+                if self._page.url != target:
+                    await self._page.goto(target, wait_until="domcontentloaded")
+                    await asyncio.sleep(2)
+                # Focus the chat input (contenteditable) and type the reply.
+                focused = await self._page.evaluate("""() => {
+                    const ta = document.querySelector(
+                        'div[contenteditable="true"], textarea'
+                    );
+                    if (!ta) return false;
+                    ta.focus();
+                    return true;
+                }""")
+                if not focused:
+                    log.warning("generate_video: chat input not found for confirm")
+                    return False
+                await self._page.keyboard.type(CONFIRM_REPLY_TEXT, delay=30)
+                await asyncio.sleep(0.3)
+                await self._page.keyboard.press("Enter")
+                log.info("generate_video: confirmation sent")
+                return True
+            except Exception as exc:
+                log.warning("generate_video: confirm failed: %s", exc)
+                return False
+        return False
+
+
     @classmethod
     def _detect_quota_block(
         cls, messages: List[Dict[str, Any]]
@@ -1644,7 +1719,7 @@ class BrowserClient:
         text_parts = []
         async for event in self.chat_completion(
             display_text, chat_ability=chat_ability, leading_blocks=leading_blocks,
-            leading_message_id=leading_message_id
+            leading_message_id=leading_message_id, idle_timeout=30
         ):
             if event.get("error"):
                 raise RuntimeError(
@@ -1731,6 +1806,13 @@ class BrowserClient:
                     "prompt": prompt,
                     "conversation_id": conversation_id,
                 }
+
+            # Doubao asks the user to confirm the params before it starts
+            # generating. Type 确认 and send once; the poll continues normally.
+            if not self._video_confirm_sent:
+                confirmed = await self._confirm_video_params(messages, conversation_id)
+                if confirmed:
+                    self._video_confirm_sent = True
 
             # No point waiting out the timeout once Doubao has said no.
             quota = self._detect_quota_block(messages)
