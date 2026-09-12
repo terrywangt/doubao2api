@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .browser_client import BrowserClient
@@ -487,6 +487,11 @@ def create_app(
         return response
 
     # ── Endpoints ──
+
+    @app.get("/", response_class=RedirectResponse)
+    async def root_redirect():
+        """Redirect / to /admin so typing the bare IP works."""
+        return RedirectResponse(url="/admin")
 
     @app.get("/health")
     async def health():

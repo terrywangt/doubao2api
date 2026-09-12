@@ -5,14 +5,18 @@ services:
     restart: always
     ports:
       - "9090:9090"
+      - "6080:6080"
     environment:
       - DOUBAO_PORT=9090
       - DOUBAO_HOST=0.0.0.0
-      - DOUBAO_API_KEY=terrywang
+      - DOUBAO_API_KEY=***
       - DOUBAO_RPM_LIMIT=50
       - DOUBAO_TIMEOUT=180
       - DOUBAO_KEEPALIVE_INTERVAL=7200
       - DOUBAO_BOT_ID=7338286299411103781
+      - DOUBAO_HEADLESS=false
+      - DISPLAY=:99
+      - DOUBAO_NOVNC_URL=http://192.168.100.1:6080/vnc.html
     volumes:
       - ./data/doubao_session.json:/app/.doubao_session.json
       - doubao_browser:/root/.doubao_browser
