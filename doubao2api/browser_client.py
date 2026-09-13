@@ -1315,67 +1315,54 @@ class BrowserClient:
         self, messages: List[Dict[str, Any]], conversation_id: str
     ) -> bool:
         """Two-step confirm: send the 确认 text reply, then click the 确认
-        card button Doubao returns, and verify generation actually started.
+        card button Doubao returns.
 
-        Doubao's confirm flow is: (1) the submit produces a text reply asking
-        the user to confirm params; (2) only after the user replies 确认 does
+        Doubao's confirm flow: (1) the submit produces a text reply asking the
+        user to confirm params; (2) only after the user replies 确认 does
         Doubao render the confirm card with real buttons; (3) clicking the
         card's 确认 button starts the generation. One step alone (text or
-        button) leaves Doubao waiting, and the job then times out at 480s
-        with the page stuck on "正在等待确认".
+        button) leaves Doubao waiting, and the job then times out at 900s
+        with the page stuck waiting.
 
-        Returns True when generation is confirmed to have started.
+        Returns True once the typed confirm was sent. The caller MUST set
+        _video_confirm_sent = True whenever this returns True — a second
+        confirm message would be consumed by Doubao as another independent
+        video request, burning quota.
         """
         if not self._page:
             return False
         try:
             log.info("generate_video: two-step confirm for convo %s",
                      conversation_id)
-            # Navigate to the conversation where the video request lives so
-            # the confirm lands in the right chat.
             target = f"https://www.doubao.com/chat/{conversation_id}"
             if self._page.url != target:
                 await self._page.goto(target, wait_until="domcontentloaded")
                 await asyncio.sleep(2)
 
-            # Step 1: reply 确认 into the chat input (this triggers Doubao to
-            # render the confirm card with real buttons).
             typed = await self._type_confirm_reply()
             if not typed:
                 log.warning("generate_video: typed confirm not sent")
                 return False
+
+            # The confirm text is already in the chat; Doubao treats it as a
+            # generation request. Never send a second one regardless of what
+            # happens next. The card button click below is a bonus that speeds
+            # up the flow when the card renders; its absence is not fatal.
             await asyncio.sleep(2.0)
 
-            # Step 2: click the 确认 button on the card that Doubao rendered
-            # in response, restricted to the conversation body so we never
-            # click unrelated UI. Retry for up to ~10s in case the card takes
-            # a moment to render.
-            deadline = time.time() + 10
+            deadline = time.time() + 12
             clicked = False
             while time.time() < deadline and not clicked:
                 clicked = await self._click_confirm_card_in_body()
                 if not clicked:
+                    clicked = await self._click_confirm_in_page()
+                if not clicked:
                     await asyncio.sleep(1.5)
-            if not clicked:
-                log.warning("generate_video: confirm card button not found "
-                            "after typing 确认")
-                return False
-            await asyncio.sleep(1.5)
-
-            # Step 3: verify generation started — the page should now show
-            # the assistant's "正在生成视频" style message. The check is
-            # short (confirm has already been sent; we only need to confirm
-            # it took).
-            started = await self._page.evaluate("""() => {
-                const t = (document.body.innerText || '');
-                return /正在.{0,12}生成|生成中|开始生成|视频生成中/.test(t)
-                       || /正在生成/.test(t);
-            }""")
-            if not started:
-                log.warning("generate_video: confirm sent but no "
-                            "generating-indicator seen")
+            if clicked:
+                log.info("generate_video: confirm card button clicked")
             else:
-                log.info("generate_video: generation started after confirm")
+                log.warning("generate_video: confirm card button not found, "
+                            "but typed confirm already sent")
             return True
         except Exception as exc:
             log.warning("generate_video: two-step confirm failed: %s", exc)
@@ -1423,6 +1410,42 @@ class BrowserClient:
             return True
         except Exception as exc:
             log.warning("generate_video: type confirm failed: %s", exc)
+            return False
+
+    async def _click_confirm_in_page(self) -> bool:
+        """Click any visible 确认 button on the whole page (shortest label,
+        excluding 取消). Broader than _click_confirm_card_in_body for cases
+        where the confirm card renders outside the message-list container."""
+        if not self._page:
+            return False
+        try:
+            clicked = await self._page.evaluate("""() => {
+                const isVisible = (el) => {
+                    const r = el.getBoundingClientRect();
+                    const cs = getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden'
+                        && cs.display !== 'none';
+                };
+                const cands = Array.from(document.querySelectorAll(
+                    'button, [role="button"], [class*="btn"]'
+                )).filter(b => {
+                    if (!isVisible(b)) return false;
+                    const t = (b.innerText || '').trim();
+                    if (!t || !t.includes('确认') || t.includes('取消')) return false;
+                    return t.length <= 8;
+                });
+                cands.sort((a, b) =>
+                    (a.innerText || '').trim().length
+                    - (b.innerText || '').trim().length
+                );
+                if (cands.length) { cands[0].click(); return true; }
+                return false;
+            }""")
+            if clicked:
+                log.info("generate_video: confirm button clicked via page scan")
+            return clicked
+        except Exception as exc:
+            log.warning("generate_video: page confirm scan failed: %s", exc)
             return False
 
     async def _click_confirm_card_in_body(self) -> bool:
