@@ -263,9 +263,11 @@ def create_app(
     _accounts = AccountPool()
     # Serialize account switches: they mutate the shared browser session.
     _switch_lock = asyncio.Lock()
-    # Serialize image generations: concurrent calls into the single headed
-    # browser page crash it and trip Doubao risk control (710022004).
-    _image_lock = asyncio.Lock()
+    # Serialize ALL generations (image and video): concurrent calls into the
+    # single headed browser page crash it and trip Doubao risk control
+    # (710022004). One account runs one generation at a time; further image
+    # and video requests queue on this lock (videos also queue as job tasks).
+    _gen_lock = asyncio.Lock()
     _video_jobs = VideoJobStore()
     # asyncio only holds weak references to tasks, so a running generation
     # would otherwise be collected mid-flight.
@@ -1039,10 +1041,11 @@ def create_app(
         _check_auth(request)
         client = _get_client()
 
-        # 串行化图片生成:同一个 headed 浏览器会话并发烧图会把页面打崩
-        # (Target page closed)并触发豆包风控(710022004 rate limited)。
-        # 用全局锁让并发请求排队,一次只打一个请求到浏览器。
-        await _image_lock.acquire()
+        # 串行化所有生成(图片+视频共用同一把锁):同一个 headed 浏览器会话
+        # 并发烧图会把页面打崩(Target page closed)并触发豆包风控
+        # (710022004 rate limited)。用全局锁让并发请求排队,一次只打一个
+        # 请求到浏览器。视频生成同样持有这把锁,图片和视频互斥。
+        await _gen_lock.acquire()
         try:
             await bucket.acquire()
             ratio = body.ratio or _size_to_ratio(body.size)
@@ -1073,7 +1076,7 @@ def create_app(
                 "data": data,
             })
         finally:
-            _image_lock.release()
+            _gen_lock.release()
 
 
     @app.post("/v1/audio/generations")
@@ -1238,7 +1241,18 @@ def create_app(
             try:
                 account = await client.switch_account(sec_user_id)
             except RuntimeError as exc:
-                raise HTTPException(status_code=502, detail=str(exc))
+                # Long-running browser sessions drift (stale passport context)
+                # and passport then rejects the switch with "参数错误". Rebuild
+                # the browser (login persists in the profile) and retry once.
+                log.warning(
+                    "accounts/switch failed (%s); restarting browser and retrying",
+                    exc,
+                )
+                try:
+                    await client.restart()
+                    account = await client.switch_account(sec_user_id)
+                except RuntimeError as exc2:
+                    raise HTTPException(status_code=502, detail=str(exc2))
             _accounts.remember(account["sec_user_id"], account["label"])
         return JSONResponse(account)
 
@@ -1263,12 +1277,16 @@ def create_app(
             model=_video_model(body),
             ref_image=_video_ref_images(body),
         )
+        # 与图片/视频 job 共用全局生成锁,一次只生成一个。
+        await _gen_lock.acquire()
         try:
             result = await _generate_video_failover(client, kwargs)
         except QuotaExhaustedError as exc:
             raise HTTPException(status_code=429, detail=str(exc))
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
+        finally:
+            _gen_lock.release()
 
         videos = result.get("videos", [])
         msg = result.get("message", "")
@@ -1437,6 +1455,9 @@ def create_app(
     async def _run_video_job(job, kwargs: dict) -> None:
         """Run one generation to completion and fold the outcome into the job."""
         job.mark_running()
+        # 视频与图片共用全局生成锁:同一账号同一时刻只跑一个生成任务,
+        # 其余视频 job 在锁上排队(任务已创建,只是等待)。
+        await _gen_lock.acquire()
         try:
             await bucket.acquire()
             result = await _generate_video_failover(_get_client(), kwargs)
@@ -1450,6 +1471,8 @@ def create_app(
             log.exception("video job %s failed", job.id)
             job.fail("generation_failed", str(exc))
             return
+        finally:
+            _gen_lock.release()
 
         videos = result.get("videos") or []
         if not videos:

@@ -2339,6 +2339,22 @@ class BrowserClient:
         if not sec_user_id:
             raise RuntimeError("switch_account: missing sec_user_id")
 
+        # Passport's account switch only works from the home page context.
+        # If the browser is parked on a /chat/<id> conversation page (e.g.
+        # after a video job navigated there), the switch returns
+        # error_code=4 参数错误. Navigate home first so the switch succeeds.
+        # NOTE: startswith(home) is NOT enough — https://www.doubao.com/chat/
+        # also starts with the home prefix, so only the exact home page is
+        # allowed to skip the navigation.
+        home = "https://www.doubao.com/"
+        try:
+            url = (self._page.url or "").rstrip("/")
+            if url != home.rstrip("/"):
+                await self._page.goto(home, wait_until="domcontentloaded")
+                await asyncio.sleep(1.5)
+        except Exception as exc:
+            log.warning("switch_account: home navigation failed: %s", exc)
+
         # p_ca is sent empty by the web client; ts is seconds.
         query = urlencode({
             "passport_jssdk_version": "4.1.5",
