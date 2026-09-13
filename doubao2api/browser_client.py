@@ -1255,77 +1255,149 @@ class BrowserClient:
     async def _confirm_video_params(
         self, messages: List[Dict[str, Any]], conversation_id: str
     ) -> bool:
-        """Type 确认 when Doubao asks the user to confirm video generation params.
+        """Confirm video params in the Doubao web UI.
 
-        Doubao's web client now replies with a confirmation message ("请先确认
-        以下参数") instead of generating immediately. The UI needs a text reply
-        of "确认" in the chat input, sent with Enter. The video generation runs
-        in a background conversation; the browser must be navigated there first,
-        otherwise the confirm lands in whatever chat is currently displayed.
+        Doubao's UI changed: instead of (or in addition to) asking for a text
+        reply, it renders a confirmation dialog with real buttons (确认/取消).
+        Prefer clicking that button (a synthetic .click() is enough for React
+        buttons); fall back to typing 确认 into the chat input when no button
+        is found.
+
         Returns True when a confirmation was sent.
         """
         if not self._page:
             return False
-        for msg in messages:
-            text = self._message_text(msg) or ""
-            if not any(m in text for m in CONFIRM_TEXT_MARKERS):
-                continue
-            try:
-                log.info("generate_video: Doubao asks for param confirmation; "
-                         "navigating to convo %s then typing \"%s\"",
-                         conversation_id, CONFIRM_REPLY_TEXT)
-                # Navigate to the conversation where the video request lives so
-                # the typed confirm reaches the right chat.
-                target = f"https://www.doubao.com/chat/{conversation_id}"
-                if self._page.url != target:
-                    await self._page.goto(target, wait_until="domcontentloaded")
-                    await asyncio.sleep(2)
-                # Focus the chat input and type the reply with real keyboard
-                # events (Playwright CDP input triggers React's onChange).
-                # Then prefer the visible send button; Enter as fallback.
-                focused = await self._page.evaluate("""() => {
-                    const ta = document.querySelector(
-                        'div[contenteditable="true"], textarea'
-                    );
-                    if (!ta) return false;
-                    ta.focus();
-                    return true;
-                }""")
-                if not focused:
-                    log.warning("generate_video: chat input not found for confirm")
-                    return False
-                await self._page.keyboard.type(CONFIRM_REPLY_TEXT, delay=30)
-                await asyncio.sleep(0.5)
-                # 先找发送按钮(文本或 aria 都可能;也可能是指示图标按钮)。
-                # 找到就点,找不到回退 Enter。
-                sent = await self._page.evaluate("""() => {
-                    const btns = Array.from(document.querySelectorAll(
-                        'button, [role="button"]'
-                    ));
-                    const send = btns.find(b => {
-                        const t = (b.innerText || '').trim();
-                        const aria = (b.getAttribute('aria-label') || '');
-                        const cls = String(b.className || '');
-                        return t === '发送' || aria === '发送' ||
-                               /send|发送|input_send/i.test(t + ' ' + aria + ' ' + cls)
-                                  && (t.length <= 6 || aria.length <= 6 || cls.length < 60);
-                    });
-                    if (send && !send.disabled) {
-                        send.click();
-                        return true;
-                    }
-                    return false;
-                }""")
-                if not sent:
-                    await self._page.keyboard.press("Enter")
-                await asyncio.sleep(0.8)
-                log.info("generate_video: confirmation sent (button=%s)", sent)
-                return True
-            except Exception as exc:
-                log.warning("generate_video: confirm failed: %s", exc)
-                return False
-        return False
+        try:
+            log.info("generate_video: Doubao asks for param confirmation; "
+                     "clicking confirm button / typing confirm (convo %s)",
+                     conversation_id)
+            # Navigate to the conversation where the video request lives so the
+            # confirm lands in the right chat.
+            target = f"https://www.doubao.com/chat/{conversation_id}"
+            if self._page.url != target:
+                await self._page.goto(target, wait_until="domcontentloaded")
+                await asyncio.sleep(2)
 
+            # 1) Semantic button click: find a visible button whose text
+            #    contains 确认 (and not 取消), shortest match first. This is
+            #    the primary path for the current UI.
+            clicked = await self._page.evaluate("""() => {
+                const isVisible = (el) => {
+                    const r = el.getBoundingClientRect();
+                    const cs = getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden'
+                        && cs.display !== 'none';
+                };
+                const btns = Array.from(document.querySelectorAll(
+                    'button, [role="button"], [class*="btn"]'
+                ));
+                const cands = btns.filter(b => {
+                    if (!isVisible(b)) return false;
+                    const t = (b.innerText || '').trim();
+                    if (!t) return false;
+                    if (!t.includes('确认')) return false;
+                    if (t.includes('取消')) return false;
+                    return t.length <= 8; // exclude noisy long labels
+                });
+                cands.sort((a, b) =>
+                    (a.innerText || '').trim().length
+                    - (b.innerText || '').trim().length
+                );
+                if (cands.length) {
+                    cands[0].click();
+                    return 'button';
+                }
+                return null;
+            }""")
+            if clicked:
+                await asyncio.sleep(0.8)
+                log.info("generate_video: confirmation button clicked (%s)", clicked)
+                return True
+
+            # 2) Fallback: type the confirmation text into the chat input
+            #    (older UI where the assistant asked for a text reply).
+            focused = await self._page.evaluate("""() => {
+                const ta = document.querySelector(
+                    'div[contenteditable="true"], textarea'
+                );
+                if (!ta) return false;
+                ta.focus();
+                return true;
+            }""")
+            if not focused:
+                log.warning("generate_video: chat input not found for confirm")
+                return False
+            await self._page.keyboard.type(CONFIRM_REPLY_TEXT, delay=30)
+            await asyncio.sleep(0.5)
+            sent = await self._page.evaluate("""() => {
+                const btns = Array.from(document.querySelectorAll(
+                    'button, [role="button"]'
+                ));
+                const send = btns.find(b => {
+                    const t = (b.innerText || '').trim();
+                    const aria = (b.getAttribute('aria-label') || '');
+                    const cls = String(b.className || '');
+                    return t === '发送' || aria === '发送' ||
+                           /send|发送|input_send/i.test(t + ' ' + aria + ' ' + cls)
+                              && (t.length <= 6 || aria.length <= 6 || cls.length < 60);
+                });
+                if (send && !send.disabled) {
+                    send.click();
+                    return true;
+                }
+                return false;
+            }""")
+            if not sent:
+                await self._page.keyboard.press("Enter")
+            await asyncio.sleep(0.8)
+            log.info("generate_video: confirmation sent (button=%s)", sent)
+            return True
+        except Exception as exc:
+            log.warning("generate_video: confirm failed: %s", exc)
+            return False
+
+
+    async def _click_confirm_if_present(self) -> bool:
+        """Click the 确认 button if the confirm dialog is currently on screen.
+
+        Returns True only when a click actually happened. Requires no page
+        navigation — used from the submit loop and from history polling.
+        """
+        if not self._page:
+            return False
+        try:
+            clicked = await self._page.evaluate("""() => {
+                const isVisible = (el) => {
+                    const r = el.getBoundingClientRect();
+                    const cs = getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden'
+                        && cs.display !== 'none';
+                };
+                const btns = Array.from(document.querySelectorAll(
+                    'button, [role="button"], [class*="btn"]'
+                ));
+                const cands = btns.filter(b => {
+                    if (!isVisible(b)) return false;
+                    const t = (b.innerText || '').trim();
+                    if (!t || !t.includes('确认') || t.includes('取消')) return false;
+                    return t.length <= 8;
+                });
+                cands.sort((a, b) =>
+                    (a.innerText || '').trim().length
+                    - (b.innerText || '').trim().length
+                );
+                if (cands.length) {
+                    cands[0].click();
+                    return true;
+                }
+                return false;
+            }""")
+            if clicked:
+                log.info("generate_video: confirm button clicked via probe")
+            return clicked
+        except Exception as exc:
+            log.warning("generate_video: confirm probe failed: %s", exc)
+            return False
 
     @classmethod
     def _detect_quota_block(
@@ -1750,28 +1822,115 @@ class BrowserClient:
 
         conversation_id = None
         text_parts = []
-        async for event in self.chat_completion(
-            display_text, chat_ability=chat_ability, leading_blocks=leading_blocks,
-            leading_message_id=leading_message_id, idle_timeout=30
-        ):
-            if event.get("error"):
-                raise RuntimeError(
-                    f"generate_video submit failed "
-                    f"({event.get('status')}): {event.get('body', '')[:300]}"
+        # Cap the submit wait: once the conversation is created, Doubao keeps
+        # the SSE open while it renders the confirm dialog / generation; the
+        # result never arrives on this stream anyway (polling does). Racing
+        # the whole collection also lets the confirm probe run on a timer
+        # below instead of only when stream events arrive.
+        async def _collect_submit():
+            nonlocal conversation_id
+            async for event in self.chat_completion(
+                display_text, chat_ability=chat_ability, leading_blocks=leading_blocks,
+                leading_message_id=leading_message_id, idle_timeout=30
+            ):
+                # While the submit SSE is open the page may already render the
+                # confirmation dialog; click it the moment it appears. This is
+                # what lets a generation continue even when the stream itself
+                # never delivers the confirm marker (which mostly shows up via
+                # history polling instead).
+                if not self._video_confirm_sent:
+                    try:
+                        if await self._click_confirm_if_present():
+                            self._video_confirm_sent = True
+                    except Exception as confirm_exc:
+                        log.warning("generate_video: early confirm probe failed: %s",
+                                    confirm_exc)
+                if event.get("error"):
+                    if event.get("status") == 0 and "Stream timeout" in str(event.get("body", "")):
+                        # Doubao keeps the submit SSE open once the conversation
+                        # is created while the confirm dialog / response is
+                        # rendered elsewhere; the conversation id may already
+                        # be known from an earlier event even when no text
+                        # arrived.
+                        log.info("generate_video: submit stream timeout, "
+                                 "continuing with conversation_id=%s", conversation_id)
+                        continue
+                    raise RuntimeError(
+                        f"generate_video submit failed "
+                        f"({event.get('status')}): {event.get('body', '')[:300]}"
+                    )
+                if event.get("error_code"):
+                    raise RuntimeError(
+                        f"generate_video submit error code="
+                        f"{event.get('error_code')}: {event.get('error_msg', '')}"
+                    )
+                if not conversation_id:
+                    cid = self.extract_conversation_id(event)
+                    if cid and cid != "0":
+                        conversation_id = cid
+                text_parts.append(self._extract_text(event))
+
+        submit_task = asyncio.create_task(_collect_submit())
+        try:
+            # Probe the confirm dialog on a timer while the submit stream is
+            # still open — the button can appear before the stream ends.
+            probe_deadline = time.time() + 15
+            while time.time() < probe_deadline:
+                done, _ = await asyncio.wait(
+                    {submit_task}, timeout=2.0,
                 )
-            if event.get("error_code"):
-                raise RuntimeError(
-                    f"generate_video submit error code="
-                    f"{event.get('error_code')}: {event.get('error_msg', '')}"
+                if submit_task in done:
+                    break
+                if not self._video_confirm_sent:
+                    try:
+                        if await self._click_confirm_if_present():
+                            self._video_confirm_sent = True
+                    except Exception as confirm_exc:
+                        log.warning("generate_video: confirm probe failed: %s",
+                                    confirm_exc)
+            else:
+                # 15s elapsed: the submit stream is unproductive. Cancel it
+                # and proceed with whatever conversation_id we already have;
+                # the video runs on Doubao's side and history polling picks it
+                # up. A missing id falls through to the samantha fallback.
+                submit_task.cancel()
+                try:
+                    await submit_task
+                except (asyncio.CancelledError, RuntimeError, Exception):
+                    pass
+                log.warning("generate_video: submit probe deadline reached "
+                            "(conversation_id=%s), proceeding to polling",
+                            conversation_id)
+        finally:
+            if not submit_task.done():
+                submit_task.cancel()
+                try:
+                    await submit_task
+                except (asyncio.CancelledError, RuntimeError, Exception):
+                    pass
+
+        # A submit request that returns nothing is a new conversation that
+        # never got a conversation_id — Doubao holds it open waiting for the
+        # param confirmation. Instead of failing, submit the same prompt again
+        # through the 2-step /samantha path, which historically starts without
+        # a confirm dialog.
+        if not conversation_id:
+            log.warning("generate_video: no conversation_id from submit, "
+                        "falling back to /samantha 2-step flow")
+            try:
+                return await self.generate_video_via_samantha(
+                    prompt, ratio=ratio, duration=duration, model=model,
+                    ref_image=ref_image,
                 )
-            if not conversation_id:
-                cid = self.extract_conversation_id(event)
-                if cid and cid != "0":
-                    conversation_id = cid
-            text_parts.append(self._extract_text(event))
+            except Exception as sam_exc:
+                raise RuntimeError(
+                    f"generate_video submit failed (no conversation_id); "
+                    f"samantha fallback also failed: {sam_exc}"
+                ) from sam_exc
 
         full_text = "".join(text_parts)
         if not conversation_id:
+            # Never reached: handled above; kept unreachable for clarity.
             raise RuntimeError(
                 f"generate_video: no conversation_id returned. reply={full_text[:300]}"
             )
@@ -1781,6 +1940,188 @@ class BrowserClient:
         return await self._poll_video_result(
             conversation_id, prompt, full_text, timeout, poll_interval
         )
+
+    async def generate_video_via_samantha(
+        self,
+        prompt: str,
+        ratio: Optional[str] = None,
+        duration: int = 10,
+        model: Optional[str] = None,
+        ref_image: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
+        timeout: float = 300,
+    ) -> Dict[str, Any]:
+        """Generate video via /samantha 2-step flow (async task_id + poll).
+
+        The /chat/completion submit path can hang waiting for a param
+        confirmation that never comes; this endpoint historically starts the
+        job directly. Falls back to this when a job produces no
+        conversation_id.
+        """
+        content_data: Dict[str, Any] = {"text": prompt}
+        if ratio:
+            content_data["ratio"] = ratio
+        if model:
+            content_data["model"] = model
+        content_data["duration"] = duration
+        if ref_image:
+            content_data["ref_image"] = ref_image
+
+        message: Dict[str, Any] = {
+            "content": json.dumps(content_data, ensure_ascii=False),
+            "content_type": 2020,
+            "attachments": [],
+            "references": [],
+            "skill": {
+                "skill_type": 17,
+                "skill_type_no_default": 17,
+                "skill_id": "17",
+                "skill_id_no_default": "17",
+            },
+        }
+
+        payload = {
+            "messages": [message],
+            "completion_option": {
+                "is_regen": False,
+                "with_suggest": True,
+                "need_create_conversation": True,
+                "launch_stage": 1,
+                "is_replace": False,
+                "is_delete": False,
+                "is_ai_playground": False,
+                "memory_type": 2,
+                "message_from": 0,
+                "use_deep_think": False,
+                "use_auto_cot": False,
+                "resend_for_regen": False,
+                "enable_commerce_credit": False,
+                "action_bar_skill_id": 17,
+            },
+            "evaluate_option": {"web_ab_params": ""},
+            "local_conversation_id": str(uuid.uuid4()),
+            "local_message_id": str(uuid.uuid4()),
+        }
+
+        log.info("generate_video_via_samantha: prompt=%s, ratio=%s, duration=%s, model=%s",
+                 prompt[:50], ratio, duration, model or VIDEO_MODEL)
+        raw = await self._samantha_request(payload, timeout=60)
+
+        # Phase 1: extract async task_id from fin_reason
+        task_id = None
+        text_parts = []
+        for data in self._parse_samantha_sse(raw):
+            et = data.get("event_type")
+            if et == 2005:
+                detail = data.get("event_data", "")
+                raise RuntimeError(f"samantha video error: {str(detail)[:500]}")
+            if et != 2001:
+                continue
+            ed = data.get("event_data", {})
+            if isinstance(ed, str):
+                try:
+                    ed = json.loads(ed)
+                except json.JSONDecodeError:
+                    continue
+            fin_reason = ed.get("fin_reason", {})
+            if fin_reason and fin_reason.get("reason") == 1:
+                async_task = fin_reason.get("async_task", {})
+                task_id = async_task.get("id", "")
+            msg = ed.get("message", {})
+            if isinstance(msg, str):
+                try:
+                    msg = json.loads(msg)
+                except json.JSONDecodeError:
+                    continue
+            if msg.get("content_type") == 2001:
+                content_raw = msg.get("content", "")
+                if isinstance(content_raw, str):
+                    try:
+                        c = json.loads(content_raw)
+                        text_parts.append(c.get("text", ""))
+                    except json.JSONDecodeError:
+                        pass
+
+        full_text = "".join(text_parts)
+        if "服务过载" in full_text or "重试" in full_text:
+            raise RuntimeError("视频生成服务过载，请稍后重试")
+
+        if not task_id:
+            if full_text:
+                return {"videos": [], "prompt": prompt, "message": full_text}
+            raise RuntimeError("samantha video: no task_id returned")
+
+        log.info("generate_video_via_samantha: polling task_id=%s", task_id)
+        return await self._poll_samantha_video_result(task_id, prompt, timeout)
+
+    async def _poll_samantha_video_result(
+        self, task_id: str, prompt: str, timeout: float = 300
+    ) -> Dict[str, Any]:
+        """Poll /samantha/chat/completion with task_id for video result."""
+        deadline = time.time() + timeout
+        videos = []
+        while time.time() < deadline:
+            poll_payload = {"task_id": task_id, "event_id": 0}
+            raw = await self._samantha_request(poll_payload, timeout=timeout)
+            videos = []
+            for data in self._parse_samantha_sse(raw):
+                et = data.get("event_type")
+                if et != 2001:
+                    continue
+                ed = data.get("event_data", {})
+                if isinstance(ed, str):
+                    try:
+                        ed = json.loads(ed)
+                    except json.JSONDecodeError:
+                        continue
+                msg = ed.get("message", {})
+                if isinstance(msg, str):
+                    try:
+                        msg = json.loads(msg)
+                    except json.JSONDecodeError:
+                        continue
+                if msg.get("content_type") != 2021:
+                    continue
+                content_raw = msg.get("content", "")
+                if isinstance(content_raw, str):
+                    try:
+                        content = json.loads(content_raw)
+                    except json.JSONDecodeError:
+                        continue
+                else:
+                    content = content_raw
+                for item in content.get("data", [content]):
+                    if not isinstance(item, dict):
+                        continue
+                    video_url = item.get("video_url", "") or item.get("url", "")
+                    if not video_url:
+                        vm_str = item.get("video_model", "")
+                        if vm_str:
+                            try:
+                                vm = json.loads(vm_str) if isinstance(vm_str, str) else vm_str
+                                vlist = vm.get("video_list", {}) or {}
+                                for _q, vinfo in vlist.items():
+                                    main_b64 = vinfo.get("main_url", "")
+                                    if main_b64:
+                                        video_url = base64.b64decode(main_b64).decode(
+                                            "utf-8", errors="replace"
+                                        )
+                                        break
+                            except (json.JSONDecodeError, Exception):
+                                pass
+                    cover_url = item.get("cover_url", "") or item.get("cover", {}).get("url", "")
+                    if video_url:
+                        videos.append({
+                            "video_url": video_url,
+                            "cover_url": cover_url,
+                            "width": item.get("width", 0),
+                            "height": item.get("height", 0),
+                            "duration": item.get("duration", 0.0),
+                        })
+            if videos:
+                break
+            await asyncio.sleep(10)
+        log.info("generate_video_via_samantha: got %d videos", len(videos))
+        return {"videos": videos, "prompt": prompt}
 
     @staticmethod
     async def _add_unwatermarked(videos: List[Dict[str, Any]]) -> None:
@@ -1841,11 +2182,17 @@ class BrowserClient:
                 }
 
             # Doubao asks the user to confirm the params before it starts
-            # generating. Send the confirmation exactly ONCE per video job:
-            # after Doubao accepts it, it replies and starts generating, and
-            # re-sending the confirm costs extra quota. The confirmation
-            # marker stays in the conversation history, so never re-check it
-            # once we have already confirmed this job.
+            # generating. Two carriers: a text marker in the conversation
+            # history, or the confirm dialog rendered in the open tab. Probe
+            # the button every poll (cheap), and send the typed confirm only
+            # once per job when the marker shows up.
+            if not self._video_confirm_sent:
+                try:
+                    if await self._click_confirm_if_present():
+                        self._video_confirm_sent = True
+                except Exception as confirm_exc:
+                    log.warning("generate_video: confirm probe failed: %s",
+                                confirm_exc)
             if not self._video_confirm_sent and any(
                 any(m in self._message_text(msg) or "" for m in CONFIRM_TEXT_MARKERS)
                 for msg in messages
