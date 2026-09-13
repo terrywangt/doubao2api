@@ -1258,104 +1258,15 @@ class BrowserClient:
     ) -> bool:
         """Confirm video params in the Doubao web UI.
 
-        Doubao's UI changed: instead of (or in addition to) asking for a text
-        reply, it renders a confirmation dialog with real buttons (确认/取消).
-        Prefer clicking that button (a synthetic .click() is enough for React
-        buttons); fall back to typing 确认 into the chat input when no button
-        is found.
+        Doubao's current UI needs a two-step confirmation: reply 确认 in the
+        chat, then click the 确认 card button Doubao renders, then wait until
+        generation actually starts. See _confirm_and_wait_until_generating.
 
         Returns True when a confirmation was sent.
         """
-        if not self._page:
-            return False
-        try:
-            log.info("generate_video: Doubao asks for param confirmation; "
-                     "clicking confirm button / typing confirm (convo %s)",
-                     conversation_id)
-            # Navigate to the conversation where the video request lives so the
-            # confirm lands in the right chat.
-            target = f"https://www.doubao.com/chat/{conversation_id}"
-            if self._page.url != target:
-                await self._page.goto(target, wait_until="domcontentloaded")
-                await asyncio.sleep(2)
-
-            # 1) Semantic button click: find a visible button whose text
-            #    contains 确认 (and not 取消), shortest match first. This is
-            #    the primary path for the current UI.
-            clicked = await self._page.evaluate("""() => {
-                const isVisible = (el) => {
-                    const r = el.getBoundingClientRect();
-                    const cs = getComputedStyle(el);
-                    return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden'
-                        && cs.display !== 'none';
-                };
-                const btns = Array.from(document.querySelectorAll(
-                    'button, [role="button"], [class*="btn"]'
-                ));
-                const cands = btns.filter(b => {
-                    if (!isVisible(b)) return false;
-                    const t = (b.innerText || '').trim();
-                    if (!t) return false;
-                    if (!t.includes('确认')) return false;
-                    if (t.includes('取消')) return false;
-                    return t.length <= 8; // exclude noisy long labels
-                });
-                cands.sort((a, b) =>
-                    (a.innerText || '').trim().length
-                    - (b.innerText || '').trim().length
-                );
-                if (cands.length) {
-                    cands[0].click();
-                    return 'button';
-                }
-                return null;
-            }""")
-            if clicked:
-                await asyncio.sleep(0.8)
-                log.info("generate_video: confirmation button clicked (%s)", clicked)
-                return True
-
-            # 2) Fallback: type the confirmation text into the chat input
-            #    (older UI where the assistant asked for a text reply).
-            focused = await self._page.evaluate("""() => {
-                const ta = document.querySelector(
-                    'div[contenteditable="true"], textarea'
-                );
-                if (!ta) return false;
-                ta.focus();
-                return true;
-            }""")
-            if not focused:
-                log.warning("generate_video: chat input not found for confirm")
-                return False
-            await self._page.keyboard.type(CONFIRM_REPLY_TEXT, delay=30)
-            await asyncio.sleep(0.5)
-            sent = await self._page.evaluate("""() => {
-                const btns = Array.from(document.querySelectorAll(
-                    'button, [role="button"]'
-                ));
-                const send = btns.find(b => {
-                    const t = (b.innerText || '').trim();
-                    const aria = (b.getAttribute('aria-label') || '');
-                    const cls = String(b.className || '');
-                    return t === '发送' || aria === '发送' ||
-                           /send|发送|input_send/i.test(t + ' ' + aria + ' ' + cls)
-                              && (t.length <= 6 || aria.length <= 6 || cls.length < 60);
-                });
-                if (send && !send.disabled) {
-                    send.click();
-                    return true;
-                }
-                return false;
-            }""")
-            if not sent:
-                await self._page.keyboard.press("Enter")
-            await asyncio.sleep(0.8)
-            log.info("generate_video: confirmation sent (button=%s)", sent)
-            return True
-        except Exception as exc:
-            log.warning("generate_video: confirm failed: %s", exc)
-            return False
+        return await self._confirm_and_wait_until_generating(
+            messages, conversation_id
+        )
 
 
     async def _click_confirm_if_present(self) -> bool:
@@ -1398,6 +1309,193 @@ class BrowserClient:
             return clicked
         except Exception as exc:
             log.warning("generate_video: confirm probe failed: %s", exc)
+            return False
+
+    async def _confirm_and_wait_until_generating(
+        self, messages: List[Dict[str, Any]], conversation_id: str
+    ) -> bool:
+        """Two-step confirm: send the 确认 text reply, then click the 确认
+        card button Doubao returns, and verify generation actually started.
+
+        Doubao's confirm flow is: (1) the submit produces a text reply asking
+        the user to confirm params; (2) only after the user replies 确认 does
+        Doubao render the confirm card with real buttons; (3) clicking the
+        card's 确认 button starts the generation. One step alone (text or
+        button) leaves Doubao waiting, and the job then times out at 480s
+        with the page stuck on "正在等待确认".
+
+        Returns True when generation is confirmed to have started.
+        """
+        if not self._page:
+            return False
+        try:
+            log.info("generate_video: two-step confirm for convo %s",
+                     conversation_id)
+            # Navigate to the conversation where the video request lives so
+            # the confirm lands in the right chat.
+            target = f"https://www.doubao.com/chat/{conversation_id}"
+            if self._page.url != target:
+                await self._page.goto(target, wait_until="domcontentloaded")
+                await asyncio.sleep(2)
+
+            # Step 1: reply 确认 into the chat input (this triggers Doubao to
+            # render the confirm card with real buttons).
+            typed = await self._type_confirm_reply()
+            if not typed:
+                log.warning("generate_video: typed confirm not sent")
+                return False
+            await asyncio.sleep(2.0)
+
+            # Step 2: click the 确认 button on the card that Doubao rendered
+            # in response, restricted to the conversation body so we never
+            # click unrelated UI. Retry for up to ~10s in case the card takes
+            # a moment to render.
+            deadline = time.time() + 10
+            clicked = False
+            while time.time() < deadline and not clicked:
+                clicked = await self._click_confirm_card_in_body()
+                if not clicked:
+                    await asyncio.sleep(1.5)
+            if not clicked:
+                log.warning("generate_video: confirm card button not found "
+                            "after typing 确认")
+                return False
+            await asyncio.sleep(1.5)
+
+            # Step 3: verify generation started — the page should now show
+            # the assistant's "正在生成视频" style message. The check is
+            # short (confirm has already been sent; we only need to confirm
+            # it took).
+            started = await self._page.evaluate("""() => {
+                const t = (document.body.innerText || '');
+                return /正在.{0,12}生成|生成中|开始生成|视频生成中/.test(t)
+                       || /正在生成/.test(t);
+            }""")
+            if not started:
+                log.warning("generate_video: confirm sent but no "
+                            "generating-indicator seen")
+            else:
+                log.info("generate_video: generation started after confirm")
+            return True
+        except Exception as exc:
+            log.warning("generate_video: two-step confirm failed: %s", exc)
+            return False
+
+    async def _type_confirm_reply(self) -> bool:
+        """Type 确认 into the chat input and send it."""
+        if not self._page:
+            return False
+        try:
+            focused = await self._page.evaluate("""() => {
+                const ta = document.querySelector(
+                    'div[contenteditable="true"], textarea'
+                );
+                if (!ta) return false;
+                ta.focus();
+                return true;
+            }""")
+            if not focused:
+                return False
+            await self._page.keyboard.type(CONFIRM_REPLY_TEXT, delay=30)
+            await asyncio.sleep(0.5)
+            sent = await self._page.evaluate("""() => {
+                const btns = Array.from(document.querySelectorAll(
+                    'button, [role="button"]'
+                ));
+                const send = btns.find(b => {
+                    const t = (b.innerText || '').trim();
+                    const aria = (b.getAttribute('aria-label') || '');
+                    const cls = String(b.className || '');
+                    return t === '发送' || aria === '发送' ||
+                           /send|发送|input_send/i.test(t + ' ' + aria + ' ' + cls)
+                              && (t.length <= 6 || aria.length <= 6 || cls.length < 60);
+                });
+                if (send && !send.disabled) {
+                    send.click();
+                    return true;
+                }
+                return false;
+            }""")
+            if not sent:
+                await self._page.keyboard.press("Enter")
+            await asyncio.sleep(1.0)
+            log.info("generate_video: typed confirm sent (button=%s)", sent)
+            return True
+        except Exception as exc:
+            log.warning("generate_video: type confirm failed: %s", exc)
+            return False
+
+    async def _click_confirm_card_in_body(self) -> bool:
+        """Click the 确认 button inside the conversation body (not arbitrary
+        page buttons), preferring the card Doubao renders after the user
+        replies 确认. Excludes 取消."""
+        if not self._page:
+            return False
+        try:
+            return await self._page.evaluate("""() => {
+                const isVisible = (el) => {
+                    const r = el.getBoundingClientRect();
+                    const cs = getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden'
+                        && cs.display !== 'none';
+                };
+                // Candidate roots: the message list / conversation body. Try
+                // common containers, else fall back to the whole document but
+                // only for buttons whose text is exactly 确认 (short, so a
+                // stray match is unlikely).
+                const roots = [
+                    document.querySelector('[class*="message"]'),
+                    document.querySelector('[class*="chat-body"]'),
+                    document.querySelector('[class*="conversation"]'),
+                    document.querySelector('[class*="dialogue"]'),
+                    document.body,
+                ].filter(Boolean);
+                const seen = new Set();
+                for (const root of roots) {
+                    const cands = Array.from(root.querySelectorAll(
+                        'button, [role="button"], [class*="btn"]'
+                    )).filter(b => {
+                        if (seen.has(b)) return false;
+                        if (!isVisible(b)) return false;
+                        const t = (b.innerText || '').trim();
+                        if (!t) return false;
+                        if (!t.includes('确认') || t.includes('取消')) return false;
+                        // The card button is short; exclude noisy long labels.
+                        return t.length <= 8;
+                    });
+                    for (const c of cands) {
+                        seen.add(c);
+                        // Prefer an exact 确认 over a longer label.
+                        const t = (c.innerText || '').trim();
+                        if (t === '确认') {
+                            c.click();
+                            return true;
+                        }
+                    }
+                }
+                // Second pass: shortest match.
+                let best = null;
+                for (const root of roots) {
+                    const cands = Array.from(root.querySelectorAll(
+                        'button, [role="button"], [class*="btn"]'
+                    )).filter(b => {
+                        if (seen.has(b)) return false;
+                        if (!isVisible(b)) return false;
+                        const t = (b.innerText || '').trim();
+                        if (!t || !t.includes('确认') || t.includes('取消')) return false;
+                        return t.length <= 8;
+                    });
+                    for (const c of cands) {
+                        seen.add(c);
+                        const l = (c.innerText || '').trim().length;
+                        if (!best || l < best.len) best = {el: c, len: l};
+                    }
+                }
+                if (best) { best.el.click(); return true; }
+                return false;
+            }""")
+        except Exception as exc:
+            log.warning("generate_video: confirm card click failed: %s", exc)
             return False
 
     @classmethod
@@ -1731,7 +1829,7 @@ class BrowserClient:
         duration: int = 10,
         model: Optional[str] = None,
         ref_image: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
-        timeout: float = 480,
+        timeout: float = 900,
         poll_interval: float = 10,
     ) -> Dict[str, Any]:
         """Generate a video via the chat endpoint's video ability.
@@ -1752,7 +1850,8 @@ class BrowserClient:
                 "width": ..., "height": ...}. Pass the list from
                 upload_ref_images() to reference several images at once; the
                 prompt then refers to them as 参考图1, 图2 and so on.
-            timeout: Give up after this many seconds.
+            timeout: Give up after this many seconds (default 900: reference-
+                image jobs and long prompts routinely exceed the old 480s).
             poll_interval: Seconds between history polls.
 
         Returns:
