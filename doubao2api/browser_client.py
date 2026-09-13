@@ -13,6 +13,7 @@ and call this signing function. All actual API traffic goes through httpx.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
