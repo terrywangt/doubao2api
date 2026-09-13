@@ -1822,13 +1822,14 @@ class BrowserClient:
 
         conversation_id = None
         text_parts = []
+        rate_limited = False
         # Cap the submit wait: once the conversation is created, Doubao keeps
         # the SSE open while it renders the confirm dialog / generation; the
         # result never arrives on this stream anyway (polling does). Racing
         # the whole collection also lets the confirm probe run on a timer
         # below instead of only when stream events arrive.
         async def _collect_submit():
-            nonlocal conversation_id
+            nonlocal conversation_id, rate_limited
             async for event in self.chat_completion(
                 display_text, chat_ability=chat_ability, leading_blocks=leading_blocks,
                 leading_message_id=leading_message_id, idle_timeout=30
@@ -1860,9 +1861,28 @@ class BrowserClient:
                         f"({event.get('status')}): {event.get('body', '')[:300]}"
                     )
                 if event.get("error_code"):
+                    code = event.get("error_code")
+                    msg = event.get("error_msg", "")
+                    if code == 710022004:
+                        rate_limited = True
+                        if conversation_id:
+                            # Risk-control throttling mid-submit. The
+                            # conversation already exists and the history
+                            # polling endpoint is a different one, so continue
+                            # and let polling decide; the video may still be
+                            # confirmable there.
+                            log.warning("generate_video: submit rate-limited "
+                                        "(710022004) but conversation_id=%s exists; "
+                                        "continuing to polling", conversation_id)
+                            continue
+                        # No conversation created yet: throttled before it
+                        # started. Raising here (without id) prevents both
+                        # pointless polling and the samantha retry.
+                        raise RuntimeError(
+                            f"generate_video submit error code={code}: {msg}"
+                        )
                     raise RuntimeError(
-                        f"generate_video submit error code="
-                        f"{event.get('error_code')}: {event.get('error_msg', '')}"
+                        f"generate_video submit error code={code}: {msg}"
                     )
                 if not conversation_id:
                     cid = self.extract_conversation_id(event)
@@ -1915,6 +1935,13 @@ class BrowserClient:
         # through the 2-step /samantha path, which historically starts without
         # a confirm dialog.
         if not conversation_id:
+            if rate_limited:
+                # Do not retry into the same throttle; surface it as-is so the
+                # caller (or the user) waits out the risk-control window.
+                raise RuntimeError(
+                    "generate_video: submit rate-limited (710022004) before a "
+                    "conversation was created"
+                )
             log.warning("generate_video: no conversation_id from submit, "
                         "falling back to /samantha 2-step flow")
             try:
