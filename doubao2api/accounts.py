@@ -88,21 +88,32 @@ class AccountPool:
                  label or sec_user_id[:12], len(self._accounts))
 
     def mark_exhausted(self, sec_user_id: str) -> None:
-        """Park an account until the next daily quota reset."""
+        """Park an account until the next daily quota reset.
+
+        Doubao refused a request, so the account is done for today whatever
+        the local counter said. The counter is kept as the observed count
+        (never inflated to the ceiling): the exhausted flag is what turns the
+        display into "used up", and inflating the number made the page look
+        like a full 10/10 quota that was actually far smaller.
+        """
         account = self.find(sec_user_id)
         if account is None:
             self.remember(sec_user_id)
             account = self.find(sec_user_id)
         today = date.today().isoformat()
         account["exhausted_on"] = today
-        # Doubao refused, so whatever we counted was an undercount.
-        account["used_on"] = today
+        if account.get("used_on") != today:
+            account["used_on"] = today
+            account["used_count"] = 0
+        # Doubao refused, so whatever we counted was an undercount; make sure
+        # the counter at least reflects that the quota is gone.
         account["used_count"] = max(
-            FREE_DAILY_QUOTA, int(account.get("used_count") or 0)
+            int(account.get("used_count") or 0), 1
         )
         self._save()
-        log.info("accounts: %s marked exhausted for today",
-                 account.get("label") or sec_user_id[:12])
+        log.info("accounts: %s marked exhausted for today (used=%s)",
+                 account.get("label") or sec_user_id[:12],
+                 account.get("used_count"))
 
     def record_usage(self, sec_user_id: str) -> None:
         """Count one completed generation against today's estimated quota."""
@@ -137,11 +148,18 @@ class AccountPool:
                 "state": "cooldown" if on_cooldown else "ready",
                 "used_today": used,
                 "quota_estimate": FREE_DAILY_QUOTA,
+                # The estimate ceiling is not Doubao's real number; once the
+                # account is exhausted the remaining is 0 by definition, and
+                # the actual daily ceiling is whatever Doubao allows (observed
+                # to be well below FREE_DAILY_QUOTA for video).
                 "remaining_estimate": (
                     0 if on_cooldown else max(0, FREE_DAILY_QUOTA - used)
                 ),
                 "cooldown_until": reset_at.isoformat() if on_cooldown else None,
                 "cooldown_seconds": cooldown_seconds if on_cooldown else 0,
+                # Human-readable truth about why this account is parked.
+                "note": "豆包今日额度已用尽(以豆包侧拒绝为准),明日重置"
+                       if on_cooldown else None,
             })
         return rows
 

@@ -1193,6 +1193,45 @@ def create_app(
                         switched["sec_user_id"], switched["label"]
                     )
                 continue
+            except RuntimeError as exc:
+                # Doubao rejected the submit outright — risk control or daily
+                # quota exhausted before a conversation was created. Treat it
+                # like an exhausted account: park it and try the next one,
+                # instead of leaving it "ready" while Doubao refuses every
+                # request (that is what made the admin page look like it had
+                # quota when it did not).
+                msg = str(exc)
+                if "710022004" in msg or "rate-limited" in msg:
+                    log.warning("video: submit refused by Doubao (%s); "
+                                "marking current account exhausted", msg[:120])
+                    async with _switch_lock:
+                        try:
+                            current = await client.current_account()
+                        except RuntimeError:
+                            raise exc
+                        _accounts.mark_exhausted(current["sec_user_id"])
+                        candidates = _accounts.candidates(
+                            exclude=current["sec_user_id"]
+                        )
+                        if not candidates:
+                            log.warning("video: no accounts left with quota today")
+                            raise exc
+                        nxt = candidates[0]
+                        log.info("video: submit refused on %s, switching to %s",
+                                 current["label"], nxt.get("label") or "?")
+                        try:
+                            switched = await client.switch_account(
+                                nxt["sec_user_id"]
+                            )
+                        except RuntimeError as sw_exc:
+                            raise RuntimeError(
+                                f"submit refused and switch failed: {sw_exc}"
+                            ) from exc
+                        _accounts.remember(
+                            switched["sec_user_id"], switched["label"]
+                        )
+                    continue
+                raise
 
             try:
                 used_by = await client.current_account()

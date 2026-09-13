@@ -1420,6 +1420,10 @@ class BrowserClient:
             except (json.JSONDecodeError, TypeError, AttributeError):
                 snapshot = {}
             reason = snapshot.get("unavailable_reason") or {}
+            log.info("generate_video: paywall refusal detected: "
+                     "feature_key=%s reason=%s text=%r",
+                     snapshot.get("feature_key", ""), reason,
+                     cls._message_text(msg)[:120])
             return {
                 "text": cls._message_text(msg),
                 "feature_key": snapshot.get("feature_key", ""),
